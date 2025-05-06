@@ -1,0 +1,51 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  mcp_server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: expense-bot-mcp
+    # Load environment variables from .env file
+    env_file:
+      - ./.env
+    ports:
+      # Map host port 8000 to container port 8000
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - expense_network
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: expense-bot-telegram
+    # Load environment variables from .env file
+    env_file:
+      - ./.env
+    volumes:
+      # Mount user settings file for persistence
+      # Important: Create an empty user_settings.json file first if it doesn't exist
+      # with content: {}
+      - ./user_settings.json:/app/user_settings.json
+      # Mount a named volume for the Whisper model cache
+      # This prevents re-downloading models on every container start
+      # faster-whisper usually caches in ~/.cache/huggingface/hub or similar
+      # Inside the container as root user, this typically maps to /root/.cache/
+      - whisper_cache:/root/.cache
+    depends_on:
+      # Wait for the mcp_server to be healthy (or just started, depending on compose version)
+      - mcp_server
+    restart: unless-stopped
+    networks:
+      - expense_network
+
+networks:
+  expense_network:
+    driver: bridge
+
+volumes:
+  # Define the named volume for Whisper model cache
+  whisper_cache: 

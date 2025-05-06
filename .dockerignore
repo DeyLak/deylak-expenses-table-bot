@@ -1,0 +1,29 @@
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git/
+.venv/
+.env
+*.tmp
+*.sqlite3
+*~
+*.swp
+.DS_Store
+# Whisper model cache (managed by volume)
+/root/.cache/huggingface/
+# User settings (managed by volume)
+user_settings.json 
