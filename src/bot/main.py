@@ -11,8 +11,9 @@ from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove # For potential future use
 # Import ApplicationBuilder instead of Application
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes 
-import anthropic # Import anthropic
-
+# --- OpenAI Import --- START
+from openai import OpenAI, RateLimitError, APIConnectionError, AuthenticationError, APIStatusError
+# --- OpenAI Import --- END
 # --- Faster Whisper Import --- START
 from faster_whisper import WhisperModel
 # --- Faster Whisper Import --- END
@@ -30,7 +31,10 @@ USER_SETTINGS_FILE = "user_settings.json"
 
 # Load token from environment variable
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ANTHROPIC_API_KEY_LOADED = os.getenv("ANTHROPIC_API_KEY")
+# --- Deepseek Variables --- START
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat") # Default model
+# --- Deepseek Variables --- END
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL") # e.g., http://127.0.0.1:8000
 # --- Add Model Name Loading ---
 # Default to Haiku if not specified
@@ -43,8 +47,10 @@ ANTHROPIC_MODEL_NAME = os.getenv("ANTHROPIC_MODEL_NAME", "claude-3-haiku-2024030
 missing_vars = []
 if not TELEGRAM_BOT_TOKEN:
     missing_vars.append("TELEGRAM_BOT_TOKEN")
-if not ANTHROPIC_API_KEY_LOADED:
-    missing_vars.append("ANTHROPIC_API_KEY")
+# --- Deepseek Key Validation --- START
+if not DEEPSEEK_API_KEY:
+    missing_vars.append("DEEPSEEK_API_KEY")
+# --- Deepseek Key Validation --- END
 if not MCP_SERVER_URL:
     missing_vars.append("MCP_SERVER_URL") # Required for core functionality
 # No need to strictly validate ANTHROPIC_MODEL_NAME as we have a default
@@ -56,19 +62,33 @@ if missing_vars:
 else:
     logger.info("All required environment variables loaded.")
     # Log the model being used
-    logger.info(f"Using Anthropic model: {ANTHROPIC_MODEL_NAME}") 
+    logger.info(f"Using Deepseek model: {DEEPSEEK_MODEL_NAME}") 
 # --- END Credential Validation ---
 
 # Be careful logging sensitive info, only log confirmation if needed
 # logger.info(f"ANTHROPIC_API_KEY loaded (checking presence): {bool(ANTHROPIC_API_KEY_LOADED)}")
 # logger.info(f"MCP_SERVER_URL: {MCP_SERVER_URL}")
 
-# Initialize Anthropic Client (explicitly pass loaded key)
-try:
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY_LOADED)
-except Exception as e:
-    logger.error(f"Failed to initialize Anthropic client: {e}")
-    anthropic_client = None # Set to None to handle gracefully later
+# --- Initialize Deepseek Client (using OpenAI library) --- START
+llm_client = None
+if DEEPSEEK_API_KEY:
+    try:
+        llm_client = OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/v1" # Point to Deepseek API
+        )
+        logger.info("Deepseek client initialized successfully (using OpenAI library).")
+        # Note: Testing connection like listing models might not work if Deepseek
+        # doesn't implement that specific OpenAI endpoint.
+    except AuthenticationError as e:
+        logger.error(f"Deepseek Authentication Error: Invalid API key? {e}")
+    except APIConnectionError as e:
+        logger.error(f"Deepseek API Connection Error: Could not connect. {e}")
+    except Exception as e:
+        logger.error(f"Failed to initialize Deepseek client: {e}")
+else:
+    logger.warning("DEEPSEEK_API_KEY not found. Deepseek LLM features will be unavailable.")
+# --- Initialize Deepseek Client --- END
 
 # --- Load Whisper Model --- START
 # Specify the model size (e.g., "tiny", "base", "small", "medium", "large-v2", "large-v3")
@@ -403,7 +423,7 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
     # user_id is still useful for logging who initiated in a group
     logger.info(f"Processing text for user {user_id} in chat {chat_id} (type: {chat_type}): '{text_to_process[:100]}...'")
 
-    if not anthropic_client:
+    if not llm_client:
         await update.message.reply_text("Извините, AI агент сейчас недоступен.")
         return
 
@@ -412,7 +432,6 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
     
     if user_context_result.get("status") == "error":
         error_detail = user_context_result.get("details", "Unknown error fetching context.")
-        # The error message from get_or_fetch_user_context is now more specific
         await update.message.reply_text(f"❌ Ошибка при получении настроек: {error_detail}")
         return
         
@@ -432,26 +451,40 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
          return
 
     try:
-        logger.info(f"Sending message to LLM ({ANTHROPIC_MODEL_NAME}) for expense parsing (user: {user_id}, chat: {chat_id})...")
-        message = anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL_NAME,
+        logger.info(f"Sending message to LLM ({DEEPSEEK_MODEL_NAME}) for expense parsing (user: {user_id}, chat: {chat_id})...")
+        completion = llm_client.chat.completions.create(
+            model=DEEPSEEK_MODEL_NAME,
             max_tokens=300,
-            system=system_prompt,
             messages=[
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text_to_process}
             ]
         )
         ai_response = ""
-        if message.content and isinstance(message.content, list):
-            first_block = message.content[0]
-            if hasattr(first_block, 'text'): ai_response = first_block.text
-            else: logger.warning(f"First content block is not a TextBlock: {type(first_block)}"); ai_response = "(Received non-text response)"
-        elif message.content: logger.warning(f"Unexpected message content format: {type(message.content)}"); ai_response = "(Received unexpected response format)"
-        else: logger.warning("Received empty content from Anthropic"); ai_response = "(No response text received)"
+        if completion.choices and completion.choices[0].message and completion.choices[0].message.content:
+            ai_response = completion.choices[0].message.content
+        else:
+            logger.warning(f"Received unexpected or empty response structure from LLM: {completion}")
+            ai_response = "(No response text received)"
         logger.info(f"Raw LLM response for user {user_id}, chat {chat_id}: {ai_response}")
 
+        # --- Extract JSON from potentially formatted LLM response --- START
+        json_string_to_parse = ai_response # Default to the raw response
+        if ai_response.strip().startswith("```") and ai_response.strip().endswith("```"):
+            # Find the start and end of the actual JSON content
+            json_start = ai_response.find('{')
+            json_end = ai_response.rfind('}')
+            if json_start != -1 and json_end != -1 and json_end > json_start:
+                json_string_to_parse = ai_response[json_start:json_end+1]
+                logger.info(f"Extracted JSON string from initial response: {json_string_to_parse}")
+            else:
+                # Could not extract JSON even though it had backticks
+                logger.warning(f"Could not extract JSON content from fenced response: {ai_response}")
+                # Proceed with the raw response, likely causing a JSONDecodeError below
+        # --- Extract JSON from potentially formatted LLM response --- END
+
         try:
-            parsed_data = json.loads(ai_response)
+            parsed_data = json.loads(json_string_to_parse)
             logger.info(f"Parsed JSON data (user: {user_id}, chat: {chat_id}): {parsed_data}")
             if isinstance(parsed_data, dict) and parsed_data.get("is_expense") is False:
                  await update.message.reply_text("Не получилось распознать расход. Попробуйте еще раз.") # Changed from "Okay, let me know..."
@@ -468,27 +501,38 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
                       participants_list_str_for_retry = "\n".join([f"{i}: {name}" for i, name in enumerate(participants)])
                       correction_prompt = f"Your previous JSON response had an incorrect number of coefficients. The 'coefficients' list MUST have exactly {num_participants} elements, matching the participants list below. Please re-analyze the original user message and provide the corrected JSON with the right number of coefficients. Original user message: \n\n`{text_to_process}`\n\nAvailable Participants:\n{participants_list_str_for_retry}" 
                       try:
-                           correction_message = anthropic_client.messages.create(model=ANTHROPIC_MODEL_NAME, max_tokens=300, messages=[{"role": "user", "content": correction_prompt}])
-                           corrected_ai_response = ""
-                           if correction_message.content and isinstance(correction_message.content, list):
-                               first_block = correction_message.content[0]
-                               if hasattr(first_block, 'text'): corrected_ai_response = first_block.text
-                           logger.info(f"LLM Correction Response for user {user_id}/chat {chat_id}: {corrected_ai_response}")
-                           json_start = corrected_ai_response.find('{'); json_end = corrected_ai_response.rfind('}')
-                           if json_start != -1 and json_end != -1 and json_end > json_start:
-                               json_string_to_parse = corrected_ai_response[json_start:json_end+1]
-                               try:
-                                   corrected_parsed_data = json.loads(json_string_to_parse)
-                                   corrected_coeffs = corrected_parsed_data.get("coefficients")
-                                   if isinstance(corrected_coeffs, list) and len(corrected_coeffs) == num_participants:
-                                       logger.info(f"LLM successfully corrected coefficient length for user {user_id}/chat {chat_id}.")
-                                       parsed_data = corrected_parsed_data; coeffs = corrected_coeffs
-                                   else:
-                                       is_valid = False; error_messages.append(f"AI не смог исправить длину списка коэффициентов. Ожидалось {num_participants}, получено {len(corrected_coeffs if isinstance(corrected_coeffs, list) else 'N/A')}.")
-                               except json.JSONDecodeError: is_valid = False; error_messages.append("Попытка исправления AI не удалась (Неверный JSON).")
-                           else: is_valid = False; error_messages.append("AI correction response did not contain valid JSON format.")
-                      except Exception: is_valid = False; error_messages.append("Ошибка во время попытки исправления AI.")
-
+                          correction_completion = llm_client.chat.completions.create(
+                              model=DEEPSEEK_MODEL_NAME, 
+                              max_tokens=300, 
+                              messages=[{"role": "user", "content": correction_prompt}]
+                          )
+                          corrected_ai_response = ""
+                          if correction_completion.choices and correction_completion.choices[0].message and correction_completion.choices[0].message.content:
+                              corrected_ai_response = correction_completion.choices[0].message.content
+                          logger.info(f"LLM Correction Response for user {user_id}/chat {chat_id}: {corrected_ai_response}")
+                          json_start = corrected_ai_response.find('{'); json_end = corrected_ai_response.rfind('}')
+                          if json_start != -1 and json_end != -1 and json_end > json_start:
+                              json_string_to_parse = corrected_ai_response[json_start:json_end+1]
+                              try:
+                                  corrected_parsed_data = json.loads(json_string_to_parse)
+                                  corrected_coeffs = corrected_parsed_data.get("coefficients")
+                                  if isinstance(corrected_coeffs, list) and len(corrected_coeffs) == num_participants:
+                                      logger.info(f"LLM successfully corrected coefficient length for user {user_id}/chat {chat_id}.")
+                                      parsed_data = corrected_parsed_data; coeffs = corrected_coeffs
+                                  else:
+                                      is_valid = False; error_messages.append(f"AI не смог исправить длину списка коэффициентов. Ожидалось {num_participants}, получено {len(corrected_coeffs if isinstance(corrected_coeffs, list) else 'N/A')}.")
+                              except json.JSONDecodeError: is_valid = False; error_messages.append("Попытка исправления AI не удалась (Неверный JSON).")
+                          else: is_valid = False; error_messages.append("AI correction response did not contain valid JSON format.")
+                      except RateLimitError as e_corr:
+                          is_valid = False; error_messages.append("Ошибка во время попытки исправления AI (Лимит запросов).")
+                          logger.error(f"LLM rate limit during correction: {e_corr}")
+                      except APIStatusError as e_corr:
+                          is_valid = False; error_messages.append("Ошибка во время попытки исправления AI (Статус API).")
+                          logger.error(f"LLM API status error during correction: {e_corr}")
+                      except Exception as e_corr:
+                          is_valid = False; error_messages.append("Ошибка во время попытки исправления AI.")
+                          logger.exception(f"Unexpected OpenAI error during correction: {e_corr}")
+ 
                   if is_valid:
                       if not isinstance(llm_spender_index, int) or not (0 <= llm_spender_index < num_participants):
                            is_valid = False; error_messages.append(f"Неверный индекс плательщика ({llm_spender_index}). Допустимый диапазон: 0-{num_participants-1}.")
@@ -544,16 +588,19 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
                  logger.warning(f"Ответ AI для пользователя {user_id}/chat {chat_id} был JSON, но не в ожидаемом формате: {parsed_data}")
                  await update.message.reply_text("Извините, не смог разобрать детали расхода. Можете перефразировать?")
         except json.JSONDecodeError:
-            logger.error(f"Не удалось декодировать JSON ответ от AI для пользователя {user_id}/chat {chat_id}: {ai_response}")
-            await update.message.reply_text(f"Хм, не смог обработать это как расход. Ответ AI: {ai_response}")
-    except anthropic.APIConnectionError as e:
-        logger.error(f"Anthropic API connection error for user {user_id}/chat {chat_id}: {e}")
+            logger.error(f"Не удалось декодировать JSON ответ от AI для пользователя {user_id}/chat {chat_id}: {json_string_to_parse}")
+            await update.message.reply_text(f"Хм, не смог обработать это как расход. Ответ AI: {json_string_to_parse}")
+    except APIConnectionError as e:
+        logger.error(f"LLM API connection error for user {user_id}/chat {chat_id}: {e}")
         await update.message.reply_text("Извините, не удалось подключиться к AI агенту.")
-    except anthropic.RateLimitError as e:
-        logger.error(f"Anthropic rate limit exceeded for user {user_id}/chat {chat_id}: {e}")
+    except RateLimitError as e:
+        logger.error(f"LLM rate limit exceeded for user {user_id}/chat {chat_id}: {e}")
         await update.message.reply_text("Извините, AI агент сейчас занят. Пожалуйста, попробуйте позже.")
-    except anthropic.APIStatusError as e:
-        logger.error(f"Anthropic API status error for user {user_id}/chat {chat_id}: {e.status_code} - {e.response}")
+    except AuthenticationError as e:
+        logger.error(f"LLM authentication error (invalid API key?) for user {user_id}/chat {chat_id}: {e}")
+        await update.message.reply_text("Ошибка аутентификации с AI агентом. Проверьте API ключ.")
+    except APIStatusError as e:
+        logger.error(f"LLM API status error for user {user_id}/chat {chat_id}: {e.status_code} - {e.response}")
         await update.message.reply_text("Извините, возникла проблема с AI агентом.")
     except Exception as e:
         logger.exception(f"An unexpected error occurred during text processing for user {user_id}/chat {chat_id}: {e}")
