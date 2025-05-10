@@ -26,3 +26,8 @@ A Telegram bot that uses an AI agent and a custom MCP server to record expenses 
 -   `/docs`: Project documentation
 -   `/scripts`: Utility scripts (e.g., Google Apps Script)
 -   `/tasks`: Task definitions (managed by Task Master)
+
+## Comands
+set_script_url - Установить ссылку на таблицу
+remove_last_expense - Удалить последний расход
+correct_last_expense - Исправить коэффициент для участника

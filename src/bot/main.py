@@ -316,6 +316,39 @@ def generate_system_prompt(participants: list, categories: list) -> str | None:
     logger.info("Generated system prompt with smallest integer ratio coefficient instructions using provided context.")
     return prompt.strip()
 
+# --- System Prompt for Correcting Last Expense Coefficient --- START
+def generate_correction_system_prompt(participants: list) -> str | None:
+    """Generates the system prompt for extracting participant and new coefficient for correction."""
+    logger.info("Generating correction system prompt using provided participants...")
+
+    if not participants:
+        logger.error("Cannot generate correction prompt: participants list is missing/empty.")
+        return None
+
+    participants_list_str = "\n".join([f"{i}: {name}" for i, name in enumerate(participants)])
+
+    prompt = f"""
+    You are an assistant helping to correct the last recorded expense. The user wants to change a coefficient for a specific participant.
+    Analyze the user's message to identify the participant (either by their name or their index from the list below) and the new coefficient value they want to set.
+    
+    You MUST respond ONLY with a valid JSON object containing these two fields: 
+    'participantIdentifier' (string, the name or index of the participant as provided by the user) and 
+    'newCoefficientValue' (string or number, the new coefficient value).
+    
+    Example Format: {{"participantIdentifier": "Коля", "newCoefficientValue": "2"}}
+    Another Example: {{"participantIdentifier": "0", "newCoefficientValue": 1.5}}
+    If the new coefficient is meant to be empty (not involved), the user might say "пусто", "убрать", or similar. In such cases, 'newCoefficientValue' should be an empty string "".
+
+    Available Participants:
+    {participants_list_str}
+    
+    Extract the participant identifier and the new coefficient value from the user's text following the command.
+    User's text will be something like: "Коля - 2" or "0 1.5" or "Саша убрать".
+    """
+    logger.info("Generated correction system prompt.")
+    return prompt.strip()
+# --- System Prompt for Correcting Last Expense Coefficient --- END
+
 # --- Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -416,6 +449,160 @@ async def remove_last_expense_command(update: Update, context: ContextTypes.DEFA
         logger.error(f"MCP call to removeLastExpense failed for key {settings_key}. Result: {error_details}")
         await update.message.reply_text(f"❌ Не удалось удалить последний расход. Ответ сервера: {error_details}")
 # --- New Command: Remove Last Expense --- END
+
+# --- New Command: Correct Last Expense Coefficient --- START
+async def correct_last_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /correct_last_expense command."""
+    user_id = str(update.effective_user.id)
+    chat_id = str(update.message.chat.id)
+    chat_type = update.message.chat.type
+    settings_key = user_id if chat_type == "private" else chat_id
+    key_type_str = "user" if chat_type == "private" else "group chat"
+    
+    logger.info(f"/correct_last_expense called by user {user_id} in {key_type_str} {settings_key}.")
+
+    if not context.args:
+        await update.message.reply_text("Пожалуйста, укажите участника и новое значение коэффициента после команды. \nПример: `/correct_last_expense Коля - 2` или `/correct_last_expense 0 1.5`")
+        return
+
+    user_input_for_correction = " ".join(context.args)
+
+    # 1. Get context (participants, script_url)
+    context_result = await get_or_fetch_user_context(user_id, chat_id, chat_type)
+    if context_result.get("status") == "error":
+        error_detail = context_result.get("details", "Unknown error fetching context.")
+        await update.message.reply_text(f"❌ Ошибка при получении настроек для коррекции: {error_detail}")
+        return
+
+    participants = context_result.get("participants", [])
+    current_script_url = context_result.get("script_url")
+
+    if not participants:
+        await update.message.reply_text("Не удалось получить список участников для этой команды. Попробуйте позже.")
+        return
+    if not current_script_url:
+         logger.error(f"Внутренняя ошибка: не удалось получить URL скрипта для коррекции для ключа {settings_key}")
+         await update.message.reply_text("Внутренняя ошибка: не удалось получить настройку URL скрипта.")
+         return
+    if not llm_client:
+        await update.message.reply_text("Извините, AI агент сейчас недоступен для обработки команды.")
+        return
+
+    # 2. Generate LLM prompt for correction
+    correction_system_prompt = generate_correction_system_prompt(participants)
+    if not correction_system_prompt:
+         await update.message.reply_text("Извините, не удалось подготовить контекст для AI ассистента (ошибка генерации промпта коррекции).")
+         return
+
+    # 3. Call LLM to extract parameters
+    try:
+        logger.info(f"Sending message to LLM ({DEEPSEEK_MODEL_NAME}) for correction parameter extraction (user: {user_id}, chat: {chat_id})...")
+        completion = llm_client.chat.completions.create(
+            model=DEEPSEEK_MODEL_NAME,
+            max_tokens=150,
+            messages=[
+                {"role": "system", "content": correction_system_prompt},
+                {"role": "user", "content": user_input_for_correction}
+            ]
+        )
+        ai_response = ""
+        if completion.choices and completion.choices[0].message and completion.choices[0].message.content:
+            ai_response = completion.choices[0].message.content
+        else:
+            logger.warning(f"Received unexpected or empty response structure from LLM for correction: {completion}")
+            await update.message.reply_text("Не удалось получить ответ от AI для извлечения параметров.")
+            return
+        logger.info(f"Raw LLM response for correction (user {user_id}, chat {chat_id}): {ai_response}")
+
+        # --- Extract JSON --- 
+        json_string_to_parse = ai_response
+        if ai_response.strip().startswith("```") and ai_response.strip().endswith("```"):
+            json_start = ai_response.find('{'); json_end = ai_response.rfind('}')
+            if json_start != -1 and json_end != -1 and json_end > json_start:
+                json_string_to_parse = ai_response[json_start:json_end+1]
+        # --- End Extract JSON ---
+
+        parsed_params = json.loads(json_string_to_parse)
+        logger.info(f"Parsed correction params from LLM (user: {user_id}, chat: {chat_id}): {parsed_params}")
+
+        participant_identifier = parsed_params.get("participantIdentifier")
+        new_coefficient_value = parsed_params.get("newCoefficientValue")
+
+        if participant_identifier is None or new_coefficient_value is None: # Allow empty string for newCoefficientValue
+            await update.message.reply_text(f"AI не смог извлечь все необходимые параметры (участник/значение). Ответ AI: {json_string_to_parse}")
+            return
+
+        # 4. Resolve participantIndex
+        coefficient_index = -1
+        try:
+            # Try to parse as an index first
+            potential_index = int(str(participant_identifier).strip())
+            if 0 <= potential_index < len(participants):
+                coefficient_index = potential_index
+            else:
+                await update.message.reply_text(f"Указанный индекс участника ({potential_index}) вне допустимого диапазона (0-{len(participants)-1}).")
+                return
+        except ValueError:
+            # If not an int, try to find by name (case-insensitive)
+            for i, p_name in enumerate(participants):
+                if str(participant_identifier).strip().lower() == p_name.lower():
+                    coefficient_index = i
+                    break
+            if coefficient_index == -1:
+                await update.message.reply_text(f"Участник '{participant_identifier}' не найден. Доступные участники: {', '.join(participants)}.")
+                return
+        
+        # 5. Validate newCoefficientValue (allow numbers or empty string)
+        if not (isinstance(new_coefficient_value, (int, float)) or new_coefficient_value == ""):
+            try:
+                new_coefficient_value = float(new_coefficient_value) # Try to convert if it's a numeric string
+            except (ValueError, TypeError):
+                if str(new_coefficient_value).strip() != "": # If it's not empty string after trying to convert
+                    await update.message.reply_text(f"Неверное значение для нового коэффициента: '{new_coefficient_value}'. Допускаются числа или пустое значение для удаления.")
+                    return
+        
+        # 6. Call MCP
+        mcp_arguments = {
+            "script_url": current_script_url,
+            "coefficientIndex": coefficient_index,
+            "coefficientValue": new_coefficient_value
+        }
+        mcp_result = await call_mcp("correctLastExpenseCoefficient", mcp_arguments)
+
+        # 7. Handle MCP Response
+        if mcp_result and isinstance(mcp_result, dict) and mcp_result.get("status") == "success":
+            corrected_participant_name = participants[coefficient_index]
+            logger.info(f"Successfully corrected last expense coefficient for participant {corrected_participant_name} (index {coefficient_index}) to {new_coefficient_value} for key {settings_key}.")
+            
+            display_coeff_value = new_coefficient_value if new_coefficient_value != "" else "(пусто)"
+            success_message = f"✅ Коэффициент для участника '{corrected_participant_name}' в последнем расходе успешно изменен на '{display_coeff_value}'."
+            await update.message.reply_text(success_message)
+        else:
+            error_details = "Unknown error." 
+            if isinstance(mcp_result, dict):
+                error_details = mcp_result.get("details", "Не удалось изменить коэффициент через сервер.")
+            logger.error(f"MCP call to correctLastExpenseCoefficient failed for key {settings_key}. Result: {error_details}")
+            await update.message.reply_text(f"❌ Не удалось изменить коэффициент. Ответ сервера: {error_details}")
+
+    except json.JSONDecodeError:
+        logger.error(f"Не удалось декодировать JSON ответ от AI для коррекции (user {user_id}/chat {chat_id}): {json_string_to_parse}")
+        await update.message.reply_text(f"Хм, не смог обработать параметры для коррекции. Ответ AI: {json_string_to_parse}")
+    except APIConnectionError as e:
+        logger.error(f"LLM API connection error during correction for user {user_id}/chat {chat_id}: {e}")
+        await update.message.reply_text("Извините, не удалось подключиться к AI агенту для коррекции.")
+    except RateLimitError as e:
+        logger.error(f"LLM rate limit exceeded during correction for user {user_id}/chat {chat_id}: {e}")
+        await update.message.reply_text("Извините, AI агент сейчас занят (коррекция). Пожалуйста, попробуйте позже.")
+    except AuthenticationError as e: # Should be caught by initial client check, but good to have
+        logger.error(f"LLM authentication error during correction for user {user_id}/chat {chat_id}: {e}")
+        await update.message.reply_text("Ошибка аутентификации с AI агентом (коррекция).")
+    except APIStatusError as e:
+        logger.error(f"LLM API status error during correction for user {user_id}/chat {chat_id}: {e.status_code} - {e.response}")
+        await update.message.reply_text("Извините, возникла проблема с AI агентом (коррекция).")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during correction command for user {user_id}/chat {chat_id}: {e}")
+        await update.message.reply_text("Извините, произошла непредвиденная ошибка при выполнении команды коррекции.")
+# --- New Command: Correct Last Expense Coefficient --- END
 
 # --- Refactored Expense Processing Logic (MODIFIED) --- 
 async def process_expense_text(text_to_process: str, user_id: str, chat_id: str, chat_type: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -551,21 +738,54 @@ async def process_expense_text(text_to_process: str, user_id: str, chat_id: str,
                               spender_name = participants[spender_idx] if 0 <= spender_idx < num_participants else f"Unknown Index {spender_idx}"
                               category_name = categories[category_idx] if 0 <= category_idx < num_categories else f"Unknown Index {category_idx}"
                               split_details_parts = []
+
                               if isinstance(coeffs_data, list) and len(coeffs_data) == num_participants:
                                   max_name_len = max(len(name) for name in participants) if participants else 10
-                                  coeff_pad_width = 1
-                                  if all(c == 1 for c in coeffs_data):
+                                  
+                                  # Check for the simple "split equally among all" case first
+                                  is_simple_equal_split = True
+                                  for c_val_check in coeffs_data:
+                                      if c_val_check != 1 and c_val_check != "1": # LLM might return string "1"
+                                          is_simple_equal_split = False
+                                          break
+
+                                  if is_simple_equal_split:
                                       split_str = "Разделено поровну между всеми"
                                   else:
-                                      for i, c_val in enumerate(coeffs_data):
+                                      # Detailed split with amounts
+                                      numeric_coeffs_values = []
+                                      for c_val_extract in coeffs_data:
+                                          try:
+                                              numeric_coeffs_values.append(float(c_val_extract))
+                                          except (ValueError, TypeError):
+                                              # If it's an empty string or non-numeric, it doesn't contribute to sum of ratios
+                                              pass 
+                                      
+                                      total_coeff_sum = sum(nc for nc in numeric_coeffs_values if isinstance(nc, (int, float)) and nc > 0) # Sum only positive coefficients for ratio
+
+                                      for i, c_val_loop in enumerate(coeffs_data):
                                           part_name = f"{participants[i]}:" if i < num_participants else f"Part_{i}"
-                                          padded_name = part_name.ljust(max_name_len + 5)
-                                          if c_val == "": padded_coeff_val = '—'.rjust(coeff_pad_width)
+                                          padded_name = part_name.ljust(max_name_len + 2) # Adjusted padding slightly
+                                          
+                                          coeff_display_str = ""
+                                          if c_val_loop == "": 
+                                              coeff_display_str = "—"
                                           else:
-                                              try: num_c = float(c_val); formatted_c = int(num_c) if num_c.is_integer() else num_c
-                                              except (ValueError, TypeError): formatted_c = c_val
-                                              padded_coeff_val = str(formatted_c).rjust(coeff_pad_width)
-                                          split_details_parts.append(f"{padded_name}{padded_coeff_val}")
+                                              try: 
+                                                  num_c_loop = float(c_val_loop)
+                                                  # Format coefficient (e.g., 2.5, 2, not 2.0)
+                                                  formatted_c_loop = int(num_c_loop) if num_c_loop.is_integer() else f"{num_c_loop:.2f}".rstrip('0').rstrip('.')
+                                                  coeff_display_str = str(formatted_c_loop)
+
+                                                  if total_coeff_sum > 0 and amount > 0 and num_c_loop > 0:
+                                                      individual_amount = (num_c_loop / total_coeff_sum) * amount
+                                                      # Format amount (e.g., 500, 250.75)
+                                                      formatted_individual_amount = int(individual_amount) if individual_amount.is_integer() else f"{individual_amount:.2f}"
+                                                      coeff_display_str += f" ({formatted_individual_amount})"
+                                              except (ValueError, TypeError): 
+                                                  coeff_display_str = str(c_val_loop) # Fallback for non-numeric as text
+                                          
+                                          split_details_parts.append(f"{padded_name}{coeff_display_str}")
                                       joined_split_details = '\n'.join(split_details_parts)
                                       split_str = f"<b>Раздел</b>:\n<code>{joined_split_details}</code>"
                               else:
@@ -712,6 +932,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("set_script_url", set_script_url_command))
     application.add_handler(CommandHandler("remove_last_expense", remove_last_expense_command))
+    application.add_handler(CommandHandler("correct_last_expense", correct_last_expense_command))
 
     # Text message handler (now calls refactored function)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

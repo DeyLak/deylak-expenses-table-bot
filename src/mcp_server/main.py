@@ -43,6 +43,11 @@ class AddExpenseArgsGAS(BaseModel):
     coefficients: List[Any] # Allow numbers or empty strings initially
     # script_url is not part of the GAS payload, so not defined here directly
 
+class CorrectLastExpenseArgs(BaseModel):
+    coefficientIndex: int = Field(..., ge=0, description="Index of the participant whose coefficient is to be corrected")
+    coefficientValue: Any = Field(..., description="The new coefficient value (can be number or empty string)")
+    # script_url will be passed but not part of this validation model for GAS payload
+
 # --- Helper Function for GAS Call --- #
 async def call_gas_webapp(script_url: str, function_name: str, payload: dict) -> dict:
     """Helper function to POST to the Google Apps Script Web App URL."""
@@ -64,10 +69,11 @@ async def call_gas_webapp(script_url: str, function_name: str, payload: dict) ->
             response.raise_for_status() # Raises exception for 4xx/5xx responses
 
             # Handle functions that might return empty on success
-            if function_name in ["addExpense", "removeLastExpense"] and not response.text.strip():
+            if function_name in ["addExpense", "removeLastExpense", "correctLastExpense"] and not response.text.strip():
                 success_detail = "Operation successful (empty response from GAS)."
                 if function_name == "addExpense": success_detail = "Expense added (empty response from GAS)."
                 if function_name == "removeLastExpense": success_detail = "Last expense removed (empty response from GAS)."
+                if function_name == "correctLastExpense": success_detail = "Last expense coefficient corrected (empty response from GAS)."
                 logger.info(f"GAS Web App returned empty response for {function_name} (assuming success).")
                 return {"status": "success", "details": success_detail}
             
@@ -229,12 +235,35 @@ async def remove_last_expense(args: dict) -> dict:
         return {"status": "error", "error_type": "Unexpected Error", "message": f"Unexpected server error calling GAS: {e}"}
 # --- New Function: Remove Last Expense --- END
 
+async def correct_last_expense_coefficient(args: dict) -> dict:
+    """Validates arguments for correcting the last expense's coefficient and calls GAS Web App."""
+    logger.info(f"Executing MCP correct_last_expense_coefficient with raw args: {args}")
+    script_url = args.get("script_url")
+    if not script_url:
+        return {"status": "error", "message": "Missing 'script_url' in arguments for correct_last_expense_coefficient."}
+
+    try:
+        # Validate only the coefficient-related fields, ignore script_url for validation
+        correction_data_to_validate = {k: v for k, v in args.items() if k != 'script_url'}
+        validated_args = CorrectLastExpenseArgs(**correction_data_to_validate)
+        logger.info(f"Validated correct_last_expense_coefficient args: {validated_args.model_dump_json()}")
+        # Call helper with validated args as payload and the extracted script_url
+        gas_result = await call_gas_webapp(script_url=script_url, function_name="correctLastExpense", payload=validated_args.model_dump())
+        return gas_result
+    except ValidationError as e:
+        logger.error(f"Validation Error for correct_last_expense_coefficient: {e}")
+        return {"status": "error", "error_type": "Validation Error", "details": e.errors()}
+    except Exception as e:
+        logger.exception(f"Unexpected error during correct_last_expense_coefficient preparation: {e}")
+        return {"status": "error", "error_type": "Unexpected Error", "details": str(e)}
+
 # --- MCP Function Registry --- #
 AVAILABLE_FUNCTIONS = {
     "addExpense": add_expense,
     "getParticipantsForUrl": get_participants_for_url,
     "getCategoriesForUrl": get_categories_for_url,
-    "removeLastExpense": remove_last_expense
+    "removeLastExpense": remove_last_expense,
+    "correctLastExpenseCoefficient": correct_last_expense_coefficient,
 }
 
 # --- Models for API --- #
